@@ -1,0 +1,1594 @@
+#include "ModMain.h"
+#include "CoopRuntimeGuards.h"
+
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+
+#include <Prey/CryAction/actiongame.h>
+#include <Prey/CryAction/IGameObject.h>
+#include <Prey/CryEntitySystem/Entity.h>
+#include <Prey/CryGame/IGame.h>
+#include <Prey/CryGame/IGameFramework.h>
+#include <Prey/CryMath/CryHalf.inl>
+#include <Prey/CryPhysics/IPhysics.h>
+#include <Prey/CrySystem/ISystem.h>
+#include <Prey/GameDll/ark/arkbreakable.h>
+#include <Prey/GameDll/ark/player/ArkPlayer.h>
+
+namespace
+{
+constexpr float kBreakableHealthEpsilon = 0.0005f;
+constexpr float kMaxHalfFloat = 65504.0f;
+constexpr uint64_t kDebugBreakableArchetype = 221ull;
+constexpr EntityGUID kDebugBreakableGuid = 0x434f4f5042524b31ull; // "COOPBRK1"
+constexpr uint64_t kDebugScalableBreakableArchetype = 10739735956144680886ull;
+constexpr EntityGUID kDebugScalableBreakableGuid = 0x434f4f5053424b31ull; // "COOPSBK1"
+constexpr uint32_t kBreakableGlassStaticTargetFlag = 1u << 1;
+
+auto s_hookCArkBreakableSetHealth = CArkBreakable::FSetHealth.MakeHook();
+auto s_hookCEntitySetBreakableGlass = CEntity::FSetBreakableGlass.MakeHook();
+auto s_hookCActionGameOnCollisionLoggedBreakable =
+    CActionGame::FOnCollisionLogged_Breakable.MakeHook();
+auto s_hookCActionGameImpactBreaksGlass =
+    CActionGame::FImpactBreaksGlass.MakeHook();
+
+thread_local int s_lastImpactBreaksGlassDecision = -1;
+
+struct RegisteredBreakableGlass
+{
+    EntityGUID guid = 0;
+    uint64_t stableId = 0;
+    std::unordered_set<int> slots;
+};
+
+std::unordered_map<EntityId, RegisteredBreakableGlass> s_registeredBreakableGlass;
+std::unordered_map<EntityId, uint64_t> s_nonBreakableGlassEntities;
+
+struct BreakableGlassCollisionCapture
+{
+    bool active = false;
+    EntityId entityId = INVALID_ENTITYID;
+    uint64_t stableId = 0;
+    int slot = -1;
+};
+
+thread_local BreakableGlassCollisionCapture s_breakableGlassCollisionCapture;
+
+uint64_t BuildBreakableGlassStableId(const IEntity& entity)
+{
+    const EntityGUID guid = entity.GetGuid();
+    if (guid != 0)
+        return static_cast<uint64_t>(guid);
+
+    uint64_t hash = 14695981039346656037ull;
+    auto mixByte = [&hash](uint8_t value)
+    {
+        hash ^= value;
+        hash *= 1099511628211ull;
+    };
+    auto mix64 = [&mixByte](uint64_t value)
+    {
+        for (int index = 0; index < 8; ++index)
+            mixByte(static_cast<uint8_t>((value >> (index * 8)) & 0xffu));
+    };
+    auto mixText = [&mixByte](const char* value)
+    {
+        if (!value)
+            return;
+        while (*value)
+            mixByte(static_cast<uint8_t>(*value++));
+    };
+
+    mix64(0x474c415353535442ull); // "GLASSSTB"
+    mixText(entity.GetName());
+    if (const IEntityClass* entityClass = entity.GetClass())
+        mixText(entityClass->GetName());
+    const Vec3 position = entity.GetWorldPos();
+    mix64(static_cast<uint64_t>(static_cast<int64_t>(std::llround(position.x * 100.0f))));
+    mix64(static_cast<uint64_t>(static_cast<int64_t>(std::llround(position.y * 100.0f))));
+    mix64(static_cast<uint64_t>(static_cast<int64_t>(std::llround(position.z * 100.0f))));
+    return hash == 0 ? 1 : hash;
+}
+
+bool RefreshBreakableGlassRegistration(IEntity& entity, bool force = false)
+{
+    const EntityId entityId = entity.GetId();
+    if (entityId == INVALID_ENTITYID)
+        return false;
+
+    const uint64_t stableId = BuildBreakableGlassStableId(entity);
+    if (const auto registered = s_registeredBreakableGlass.find(entityId);
+        registered != s_registeredBreakableGlass.end() &&
+        registered->second.stableId == stableId &&
+        !registered->second.slots.empty())
+    {
+        return true;
+    }
+    if (const auto rejected = s_nonBreakableGlassEntities.find(entityId);
+        rejected != s_nonBreakableGlassEntities.end() &&
+        rejected->second == stableId && !force)
+    {
+        return false;
+    }
+
+    int slotCount = 0;
+    std::string reason;
+    if (!CoopRuntimeGuards::TryGuardedCall(
+            "breakable glass GetSlotCount",
+            [&entity]() { return entity.GetSlotCount(); },
+            slotCount,
+            &reason) ||
+        slotCount <= 0)
+    {
+        return false;
+    }
+
+    std::unordered_set<int> slots;
+    const int boundedSlotCount = std::min(slotCount, 256);
+    for (int slot = 0; slot < boundedSlotCount; ++slot)
+    {
+        IArkGlass* glass = nullptr;
+        if (CoopRuntimeGuards::TryGuardedCall(
+                "breakable glass GetBreakableGlass",
+                [&entity, slot]()
+                {
+                    return CEntity::FGetBreakableGlass(
+                        static_cast<CEntity*>(&entity), slot);
+                },
+                glass,
+                &reason) &&
+            glass)
+        {
+            slots.insert(slot);
+        }
+    }
+
+    if (slots.empty())
+    {
+        s_nonBreakableGlassEntities[entityId] = stableId;
+        return false;
+    }
+
+    RegisteredBreakableGlass& registered = s_registeredBreakableGlass[entityId];
+    registered.guid = entity.GetGuid();
+    registered.stableId = stableId;
+    registered.slots.insert(slots.begin(), slots.end());
+    s_nonBreakableGlassEntities.erase(entityId);
+    return registered.stableId != 0;
+}
+
+void RefreshAllBreakableGlassRegistrations()
+{
+    if (!gEnv || !gEnv->pEntitySystem)
+        return;
+
+    IEntityIt* rawIterator = gEnv->pEntitySystem->GetEntityIterator();
+    if (!rawIterator)
+        return;
+
+    IEntityItPtr iterator = rawIterator;
+    iterator->MoveFirst();
+    while (!iterator->IsEnd())
+    {
+        IEntity* entity = iterator->Next();
+        if (!entity)
+            break;
+        RefreshBreakableGlassRegistration(*entity, true);
+    }
+}
+
+IEntity* FindEntityByBreakableGlassStableId(uint64_t stableId)
+{
+    if (stableId == 0 || !gEnv || !gEnv->pEntitySystem)
+        return nullptr;
+
+    IEntityIt* rawIterator = gEnv->pEntitySystem->GetEntityIterator();
+    if (!rawIterator)
+        return nullptr;
+
+    IEntityItPtr iterator = rawIterator;
+    iterator->MoveFirst();
+    while (!iterator->IsEnd())
+    {
+        IEntity* candidate = iterator->Next();
+        if (!candidate)
+            break;
+        if (BuildBreakableGlassStableId(*candidate) == stableId)
+            return candidate;
+    }
+    return nullptr;
+}
+
+#pragma pack(push, 1)
+struct BreakableGlassImpactWire
+{
+    float point[3] = {};
+    float normal[3] = {};
+    uint16_t localVelocity[2][3] = {};
+    uint16_t mass[2] = {};
+    uint16_t penetration = 0;
+    uint16_t normalImpulse = 0;
+    uint16_t radius = 0;
+    int16_t partId[2] = {};
+    int16_t materialId[2] = {};
+    int16_t primitiveId[2] = {};
+};
+#pragma pack(pop)
+
+static_assert(sizeof(BreakableGlassImpactWire) == 58);
+
+uint16_t EncodeGlassHalf(float value)
+{
+    if (!std::isfinite(value))
+        value = 0.0f;
+    return static_cast<uint16_t>(CryConvertFloatToHalf(
+        std::clamp(value, -kMaxHalfFloat, kMaxHalfFloat)));
+}
+
+float DecodeGlassHalf(uint16_t value)
+{
+    return CryConvertHalfToFloat(static_cast<CryHalf>(value));
+}
+
+std::string EncodeGlassPayload(const BreakableGlassImpactWire& payload)
+{
+    static constexpr char kAlphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const auto* bytes = reinterpret_cast<const uint8_t*>(&payload);
+    std::string encoded;
+    encoded.reserve(((sizeof(payload) + 2) / 3) * 4);
+    for (size_t i = 0; i < sizeof(payload); i += 3)
+    {
+        const uint32_t value =
+            static_cast<uint32_t>(bytes[i]) << 16 |
+            (i + 1 < sizeof(payload) ? static_cast<uint32_t>(bytes[i + 1]) << 8 : 0) |
+            (i + 2 < sizeof(payload) ? static_cast<uint32_t>(bytes[i + 2]) : 0);
+        encoded.push_back(kAlphabet[(value >> 18) & 0x3f]);
+        encoded.push_back(kAlphabet[(value >> 12) & 0x3f]);
+        encoded.push_back(i + 1 < sizeof(payload) ? kAlphabet[(value >> 6) & 0x3f] : '=');
+        encoded.push_back(i + 2 < sizeof(payload) ? kAlphabet[value & 0x3f] : '=');
+    }
+    return encoded;
+}
+
+int DecodeGlassBase64Character(char value)
+{
+    if (value >= 'A' && value <= 'Z')
+        return value - 'A';
+    if (value >= 'a' && value <= 'z')
+        return value - 'a' + 26;
+    if (value >= '0' && value <= '9')
+        return value - '0' + 52;
+    if (value == '+')
+        return 62;
+    if (value == '/')
+        return 63;
+    return -1;
+}
+
+bool DecodeGlassPayload(std::string_view encoded, BreakableGlassImpactWire& payload)
+{
+    constexpr size_t kEncodedSize = ((sizeof(payload) + 2) / 3) * 4;
+    if (encoded.size() != kEncodedSize)
+        return false;
+
+    std::array<uint8_t, sizeof(payload)> bytes = {};
+    size_t output = 0;
+    for (size_t i = 0; i < encoded.size(); i += 4)
+    {
+        const int a = DecodeGlassBase64Character(encoded[i]);
+        const int b = DecodeGlassBase64Character(encoded[i + 1]);
+        const int c = encoded[i + 2] == '=' ? 0 : DecodeGlassBase64Character(encoded[i + 2]);
+        const int d = encoded[i + 3] == '=' ? 0 : DecodeGlassBase64Character(encoded[i + 3]);
+        if (a < 0 || b < 0 || c < 0 || d < 0)
+            return false;
+        const uint32_t value =
+            static_cast<uint32_t>(a) << 18 |
+            static_cast<uint32_t>(b) << 12 |
+            static_cast<uint32_t>(c) << 6 |
+            static_cast<uint32_t>(d);
+        if (output < bytes.size())
+            bytes[output++] = static_cast<uint8_t>((value >> 16) & 0xff);
+        if (output < bytes.size() && encoded[i + 2] != '=')
+            bytes[output++] = static_cast<uint8_t>((value >> 8) & 0xff);
+        if (output < bytes.size() && encoded[i + 3] != '=')
+            bytes[output++] = static_cast<uint8_t>(value & 0xff);
+    }
+    if (output != bytes.size())
+        return false;
+    std::memcpy(&payload, bytes.data(), sizeof(payload));
+    return true;
+}
+
+uint64_t BuildStaticBreakableGlassStableId(
+    const EventPhysCollision& collision,
+    int staticSide)
+{
+    uint64_t hash = 14695981039346656037ull;
+    auto mix64 = [&hash](uint64_t value)
+    {
+        for (int index = 0; index < 8; ++index)
+        {
+            hash ^= (value >> (index * 8)) & 0xffu;
+            hash *= 1099511628211ull;
+        }
+    };
+
+    mix64(0x53544154474c4153ull); // "STATGLAS"
+    for (int axis = 0; axis < 3; ++axis)
+    {
+        mix64(static_cast<uint64_t>(static_cast<int64_t>(
+            std::llround(collision.pt[axis] * 10.0f))));
+        mix64(static_cast<uint64_t>(static_cast<int64_t>(
+            std::llround(std::fabs(collision.n[axis]) * 100.0f))));
+    }
+    mix64(static_cast<uint16_t>(collision.idmat[staticSide]));
+    return hash == 0 ? 1 : hash;
+}
+
+bool ResolveStaticBreakableGlassTarget(
+    const Vec3& point,
+    const Vec3& normal,
+    short expectedMaterial,
+    ray_hit& hit,
+    std::string& reason)
+{
+    if (!gEnv || !gEnv->pPhysicalWorld)
+    {
+        reason = "missing_physical_world";
+        return false;
+    }
+
+    const Vec3 rayNormal = normal.GetNormalizedSafe(Vec3(0.0f, 1.0f, 0.0f));
+    for (float direction : {1.0f, -1.0f})
+    {
+        std::array<ray_hit, 16> hits{};
+        const Vec3 origin = point + rayNormal * (0.35f * direction);
+        const Vec3 ray = rayNormal * (-0.7f * direction);
+        int hitCount = 0;
+        if (!CoopRuntimeGuards::TryGuardedCall(
+                "breakable glass static raycast",
+                [&]()
+                {
+                    return gEnv->pPhysicalWorld->RayWorldIntersection(
+                        origin,
+                        ray,
+                        ent_static,
+                        // Authored glass is pierceable. Stop at its first
+                        // physical surface so the observer can resolve the
+                        // same pane accepted by the sender's native impact.
+                        rwi_stop_at_pierceable | rwi_ignore_noncolliding,
+                        hits.data(),
+                        static_cast<int>(hits.size()),
+                        nullptr,
+                        0,
+                        nullptr,
+                        0,
+                        "CoopBreakableGlassReplay");
+                },
+                hitCount,
+                &reason) ||
+            hitCount <= 0)
+        {
+            continue;
+        }
+
+        const int candidateCount = std::min(hitCount, static_cast<int>(hits.size()));
+        for (int index = 0; index < candidateCount; ++index)
+        {
+            ray_hit& candidate = hits[index];
+            if (!candidate.pCollider || candidate.surface_idx != expectedMaterial)
+                continue;
+
+            int foreignType = -1;
+            if (CoopRuntimeGuards::TryGuardedCall(
+                    "breakable glass static foreign type",
+                    [&candidate]() { return candidate.pCollider->GetiForeignData(); },
+                    foreignType,
+                    &reason) &&
+                foreignType == PHYS_FOREIGN_ID_STATIC)
+            {
+                hit = candidate;
+                return true;
+            }
+        }
+    }
+
+    reason = "missing_static_glass_material_" + std::to_string(expectedMaterial);
+    return false;
+}
+
+IEntity* ResolveGlassPhysicsEntity(IPhysicalEntity* physics)
+{
+    if (!physics || physics == WORLD_ENTITY || !gEnv || !gEnv->pEntitySystem)
+        return nullptr;
+
+    IEntity* entity = nullptr;
+    std::string reason;
+    if (!CoopRuntimeGuards::TryGuardedCall(
+            "breakable glass GetEntityFromPhysics",
+            [physics]() { return gEnv->pEntitySystem->GetEntityFromPhysics(physics); },
+            entity,
+            &reason))
+    {
+        return nullptr;
+    }
+    return entity;
+}
+
+std::string BreakableStatusToken(std::string value)
+{
+    if (value.empty())
+        return "-";
+    for (char& ch : value)
+    {
+        if (!std::isalnum(static_cast<unsigned char>(ch)) && ch != '-' && ch != '.')
+            ch = '_';
+    }
+    return value;
+}
+
+CArkBreakable* GetBreakableExtension(IEntity& entity, std::string* outReason)
+{
+    std::string localReason;
+    std::string& reason = outReason ? *outReason : localReason;
+    if (!gEnv || !gEnv->pGame)
+    {
+        reason = "missing_game_runtime";
+        return nullptr;
+    }
+
+    IGameFramework* framework = gEnv->pGame->GetIGameFramework();
+    IGameObject* gameObject = nullptr;
+    if (!framework ||
+        !CoopRuntimeGuards::TryGuardedCall(
+            "breakable GetGameObject",
+            [framework, &entity]() { return framework->GetGameObject(entity.GetId()); },
+            gameObject,
+            &reason) ||
+        !gameObject)
+    {
+        reason = "missing_breakable_game_object";
+        return nullptr;
+    }
+
+    constexpr const char* kExtensionNames[] = {"ArkBreakable", "ArkScalableBreakable"};
+    for (const char* extensionName : kExtensionNames)
+    {
+        IGameObjectExtension* extension = nullptr;
+        IGameObjectSystem::ExtensionID extensionId = 0;
+        if (CoopRuntimeGuards::TryGuardedCall(
+                "breakable GetExtensionId",
+                [gameObject, extensionName]() { return gameObject->GetExtensionId(extensionName); },
+                extensionId,
+                &reason) &&
+            extensionId != 0 &&
+            CoopRuntimeGuards::TryGuardedCall(
+                "breakable QueryExtension id",
+                [gameObject, extensionId]() { return gameObject->QueryExtension(extensionId); },
+                extension,
+                &reason) &&
+            extension)
+        {
+            return static_cast<CArkBreakable*>(extension);
+        }
+
+        extension = nullptr;
+        if (CoopRuntimeGuards::TryGuardedCall(
+                "breakable QueryExtension name",
+                [gameObject, extensionName]() { return gameObject->QueryExtension(extensionName); },
+                extension,
+                &reason) &&
+            extension)
+        {
+            return static_cast<CArkBreakable*>(extension);
+        }
+    }
+
+    reason = "missing_breakable_extension";
+    return nullptr;
+}
+
+uint16_t EncodeBreakableHealth(float health)
+{
+    const float bounded = std::clamp(health, 0.0f, kMaxHalfFloat);
+    uint16_t encoded = static_cast<uint16_t>(CryConvertFloatToHalf(bounded));
+    while (encoded > 0 && CryConvertHalfToFloat(static_cast<CryHalf>(encoded)) > bounded)
+        --encoded;
+    return encoded;
+}
+
+bool DecodeBreakableHealth(uint16_t encoded, float& health)
+{
+    health = CryConvertHalfToFloat(static_cast<CryHalf>(encoded));
+    return std::isfinite(health) && health >= 0.0f && health <= kMaxHalfFloat;
+}
+
+CArkBreakable* GetDebugBreakable(IEntity** outEntity, std::string& reason)
+{
+    if (outEntity)
+        *outEntity = nullptr;
+    if (!gEnv || !gEnv->pEntitySystem)
+    {
+        reason = "missing_entity_system";
+        return nullptr;
+    }
+
+    IEntity* entity = nullptr;
+    constexpr EntityGUID kDebugGuids[] = {kDebugScalableBreakableGuid, kDebugBreakableGuid};
+    for (const EntityGUID guid : kDebugGuids)
+    {
+        EntityId entityId = INVALID_ENTITYID;
+        if (CoopRuntimeGuards::TryGuardedCall(
+                "debug breakable FindEntityByGuid",
+                [guid]() { return gEnv->pEntitySystem->FindEntityByGuid(guid); },
+                entityId,
+                &reason) &&
+            entityId != INVALID_ENTITYID &&
+            CoopRuntimeGuards::TryGuardedCall(
+                "debug breakable GetEntity",
+                [entityId]() { return gEnv->pEntitySystem->GetEntity(entityId); },
+                entity,
+                &reason) &&
+            entity)
+        {
+            break;
+        }
+    }
+    if (!entity)
+    {
+        reason = "missing_debug_breakable";
+        return nullptr;
+    }
+
+    if (outEntity)
+        *outEntity = entity;
+    return GetBreakableExtension(*entity, &reason);
+}
+
+CArkBreakable* GetBreakableByGuid(uint64_t guid, IEntity** outEntity, std::string& reason)
+{
+    if (outEntity)
+        *outEntity = nullptr;
+    if (!gEnv || !gEnv->pEntitySystem || guid == 0)
+    {
+        reason = "missing_breakable_target";
+        return nullptr;
+    }
+
+    EntityId entityId = INVALID_ENTITYID;
+    IEntity* entity = nullptr;
+    if (!CoopRuntimeGuards::TryGuardedCall(
+            "target breakable FindEntityByGuid",
+            [guid]() { return gEnv->pEntitySystem->FindEntityByGuid(static_cast<EntityGUID>(guid)); },
+            entityId,
+            &reason) ||
+        entityId == INVALID_ENTITYID ||
+        !CoopRuntimeGuards::TryGuardedCall(
+            "target breakable GetEntity",
+            [entityId]() { return gEnv->pEntitySystem->GetEntity(entityId); },
+            entity,
+            &reason) ||
+        !entity)
+    {
+        reason = "missing_breakable_guid_" + std::to_string(guid);
+        return nullptr;
+    }
+
+    CArkBreakable* breakable = GetBreakableExtension(*entity, &reason);
+    if (breakable && outEntity)
+        *outEntity = entity;
+    return breakable;
+}
+
+CArkBreakable* FindNearestAuthoredBreakable(IEntity** outEntity, std::string& reason)
+{
+    if (outEntity)
+        *outEntity = nullptr;
+    if (!gEnv || !gEnv->pEntitySystem || !ArkPlayer::GetInstancePtr() || !ArkPlayer::GetInstance().GetEntity())
+    {
+        reason = "missing_breakable_runtime";
+        return nullptr;
+    }
+
+    IEntityIt* rawIterator = nullptr;
+    if (!CoopRuntimeGuards::TryGuardedCall(
+            "nearest breakable GetEntityIterator",
+            []() { return gEnv->pEntitySystem->GetEntityIterator(); },
+            rawIterator,
+            &reason) ||
+        !rawIterator)
+    {
+        return nullptr;
+    }
+
+    const Vec3 playerPosition = ArkPlayer::GetInstance().GetEntity()->GetWorldPos();
+    IEntityItPtr iterator = rawIterator;
+    CoopRuntimeGuards::TryGuardedVoidCall("nearest breakable MoveFirst", [&iterator]() { iterator->MoveFirst(); }, &reason);
+    IEntity* bestEntity = nullptr;
+    CArkBreakable* bestBreakable = nullptr;
+    float bestDistanceSq = std::numeric_limits<float>::max();
+    while (true)
+    {
+        bool atEnd = false;
+        if (!CoopRuntimeGuards::TryGuardedCall("nearest breakable IsEnd", [&iterator]() { return iterator->IsEnd(); }, atEnd, &reason) || atEnd)
+            break;
+
+        IEntity* candidate = nullptr;
+        if (!CoopRuntimeGuards::TryGuardedCall("nearest breakable Next", [&iterator]() { return iterator->Next(); }, candidate, &reason) || !candidate)
+            break;
+
+        uint64_t guid = 0;
+        IEntityClass* entityClass = nullptr;
+        const char* className = nullptr;
+        if (!CoopRuntimeGuards::TryGuardedCall("nearest breakable GetGuid", [candidate]() { return candidate->GetGuid(); }, guid, &reason) || guid == 0 ||
+            !CoopRuntimeGuards::TryGuardedCall("nearest breakable GetClass", [candidate]() { return candidate->GetClass(); }, entityClass, &reason) || !entityClass ||
+            !CoopRuntimeGuards::TryGuardedCall("nearest breakable class GetName", [entityClass]() { return entityClass->GetName(); }, className, &reason) ||
+            !className || std::strcmp(className, "ArkBreakable") != 0)
+        {
+            continue;
+        }
+
+        CArkBreakable* candidateBreakable = GetBreakableExtension(*candidate, &reason);
+        float health = 0.0f;
+        Vec3 position(ZERO);
+        if (!candidateBreakable ||
+            !CoopRuntimeGuards::TryGuardedCall("nearest breakable health", [candidateBreakable]() { return candidateBreakable->m_health; }, health, &reason) ||
+            health < 7.0f ||
+            !CoopRuntimeGuards::TryGuardedCall("nearest breakable position", [candidate]() { return candidate->GetWorldPos(); }, position, &reason))
+        {
+            continue;
+        }
+
+        const float distanceSq = (position - playerPosition).GetLengthSquared();
+        if (distanceSq < bestDistanceSq)
+        {
+            bestDistanceSq = distanceSq;
+            bestEntity = candidate;
+            bestBreakable = candidateBreakable;
+        }
+    }
+
+    if (!bestBreakable)
+    {
+        reason = "missing_authored_breakable";
+        return nullptr;
+    }
+    if (outEntity)
+        *outEntity = bestEntity;
+    return bestBreakable;
+}
+
+void CArkBreakable_SetHealth_Hook(CArkBreakable* breakable, const float health)
+{
+    float before = 0.0f;
+    std::string reason;
+    const bool beforeOk = breakable && CoopRuntimeGuards::TryGuardedCall(
+        "breakable SetHealth read before",
+        [breakable]() { return breakable->m_health; },
+        before,
+        &reason);
+
+    s_hookCArkBreakableSetHealth.InvokeOrig(breakable, health);
+
+    float after = 0.0f;
+    const bool afterOk = breakable && CoopRuntimeGuards::TryGuardedCall(
+        "breakable SetHealth read after",
+        [breakable]() { return breakable->m_health; },
+        after,
+        &reason);
+    if (gMod && beforeOk && afterOk)
+        gMod->OnNativeBreakableHealthChanged(breakable, before, after, "CArkBreakable::SetHealth");
+}
+
+int CEntity_SetBreakableGlass_Hook(CEntity* entity, int slot, IArkGlass* glass)
+{
+    const int result = s_hookCEntitySetBreakableGlass.InvokeOrig(entity, slot, glass);
+    if (!entity)
+        return result;
+
+    const int actualSlot = slot >= 0 ? slot : result;
+    if (actualSlot < 0)
+        return result;
+
+    const EntityId entityId = entity->GetId();
+    const EntityGUID guid = entity->GetGuid();
+    const uint64_t stableId = BuildBreakableGlassStableId(*entity);
+    if (entityId == INVALID_ENTITYID || stableId == 0)
+        return result;
+
+    if (glass)
+    {
+        s_nonBreakableGlassEntities.erase(entityId);
+        RegisteredBreakableGlass& registered = s_registeredBreakableGlass[entityId];
+        if (registered.guid != guid || registered.stableId != stableId)
+        {
+            registered.guid = guid;
+            registered.stableId = stableId;
+            registered.slots.clear();
+        }
+        registered.slots.insert(actualSlot);
+        if (s_breakableGlassCollisionCapture.active)
+        {
+            s_breakableGlassCollisionCapture.entityId = entityId;
+            s_breakableGlassCollisionCapture.stableId = stableId;
+            s_breakableGlassCollisionCapture.slot = actualSlot;
+        }
+    }
+    else if (const auto registeredIt = s_registeredBreakableGlass.find(entityId);
+        registeredIt != s_registeredBreakableGlass.end() &&
+        registeredIt->second.guid == guid && registeredIt->second.stableId == stableId)
+    {
+        registeredIt->second.slots.erase(actualSlot);
+        if (registeredIt->second.slots.empty())
+        {
+            s_registeredBreakableGlass.erase(registeredIt);
+            s_nonBreakableGlassEntities[entityId] = stableId;
+        }
+    }
+    return result;
+}
+
+void CActionGame_OnCollisionLogged_Breakable_Hook(const EventPhys* event)
+{
+    EventPhysCollision collision;
+    bool collisionOk = false;
+
+    if (event && event->idval == EventPhysCollision::id)
+    {
+        const auto* source = static_cast<const EventPhysCollision*>(event);
+        std::string reason;
+        collisionOk = CoopRuntimeGuards::TryGuardedVoidCall(
+            "breakable glass collision copy",
+            [&collision, source]() { std::memcpy(&collision, source, sizeof(collision)); },
+            &reason);
+    }
+
+    // Procedural panes do not exist in CEntity's glass registry until Vanilla
+    // recognizes a real impact. Capture that native SetBreakableGlass signal
+    // instead of guessing at CryEngine material-manager ABI or surface flags.
+    const BreakableGlassCollisionCapture previousCapture =
+        s_breakableGlassCollisionCapture;
+    s_breakableGlassCollisionCapture = {};
+    s_breakableGlassCollisionCapture.active = collisionOk;
+    s_lastImpactBreaksGlassDecision = -1;
+    s_hookCActionGameOnCollisionLoggedBreakable.InvokeOrig(event);
+    BreakableGlassCollisionCapture captured =
+        s_breakableGlassCollisionCapture;
+    s_breakableGlassCollisionCapture = previousCapture;
+
+    // SetBreakableGlass identifies the pane on its first fracture. Later
+    // impacts on the already-created shards reuse that registered glass node
+    // without calling SetBreakableGlass again, so recover it from the target
+    // physics entity after Vanilla accepts the impact.
+    if (collisionOk && s_lastImpactBreaksGlassDecision == 1 &&
+        captured.entityId == INVALID_ENTITYID)
+    {
+        for (int side = 0; side < 2; ++side)
+        {
+            IEntity* candidate = ResolveGlassPhysicsEntity(collision.pEntity[side]);
+            if (!candidate)
+                continue;
+            const auto registered = s_registeredBreakableGlass.find(candidate->GetId());
+            if (registered == s_registeredBreakableGlass.end() ||
+                registered->second.stableId == 0 ||
+                registered->second.slots.empty())
+            {
+                continue;
+            }
+
+            captured.entityId = candidate->GetId();
+            captured.stableId = registered->second.stableId;
+            const int partId = collision.partid[side];
+            captured.slot = registered->second.slots.find(partId) !=
+                    registered->second.slots.end()
+                ? partId
+                : *registered->second.slots.begin();
+            break;
+        }
+    }
+
+    if (gMod && collisionOk && captured.entityId != INVALID_ENTITYID &&
+        captured.stableId != 0 && captured.slot >= 0)
+    {
+        int glassSide = -1;
+        for (int side = 0; side < 2; ++side)
+        {
+            IEntity* candidate = ResolveGlassPhysicsEntity(collision.pEntity[side]);
+            if (candidate && candidate->GetId() == captured.entityId)
+            {
+                glassSide = side;
+                break;
+            }
+        }
+        if (glassSide >= 0)
+        {
+            gMod->OnNativeBreakableGlassImpact(
+                collision, captured.stableId, glassSide, captured.slot);
+        }
+    }
+    else if (gMod && collisionOk && s_lastImpactBreaksGlassDecision == 1)
+    {
+        for (int side = 0; side < 2; ++side)
+        {
+            if (collision.iForeignData[side] != PHYS_FOREIGN_ID_STATIC)
+                continue;
+            gMod->OnNativeBreakableGlassImpact(
+                collision,
+                BuildStaticBreakableGlassStableId(collision, side),
+                side,
+                0,
+                true);
+            break;
+        }
+    }
+}
+
+bool CActionGame_ImpactBreaksGlass_Hook(
+    const EventPhysCollision& collision,
+    const ISurfaceType* surfaceType)
+{
+    const bool result = s_hookCActionGameImpactBreaksGlass.InvokeOrig(
+        collision, surfaceType);
+    s_lastImpactBreaksGlassDecision = result ? 1 : 0;
+    return result;
+}
+}
+
+void ModMain::InitBreakableSyncHooks()
+{
+    s_hookCArkBreakableSetHealth.SetHookFunc(&CArkBreakable_SetHealth_Hook);
+    s_hookCEntitySetBreakableGlass.SetHookFunc(&CEntity_SetBreakableGlass_Hook);
+    s_hookCActionGameOnCollisionLoggedBreakable.SetHookFunc(
+        &CActionGame_OnCollisionLogged_Breakable_Hook);
+    s_hookCActionGameImpactBreaksGlass.SetHookFunc(
+        &CActionGame_ImpactBreaksGlass_Hook);
+}
+
+void ModMain::OnNativeBreakableHealthChanged(
+    CArkBreakable* breakable,
+    float before,
+    float after,
+    const char* reason)
+{
+    ++m_breakableHealthHookCalls;
+    if (!breakable || !std::isfinite(before) || !std::isfinite(after) ||
+        after + kBreakableHealthEpsilon >= before ||
+        m_applyingRemoteAreaObjectEvent ||
+        m_saveLoadGuardActive || m_arkLevelTransitionLoadActive ||
+        IsPostLoadNativeQuarantineActive() ||
+        m_networkMode == CoopNetworkMode::Off || !IsSessionGameplayReady())
+    {
+        ++m_breakableHealthEventSkips;
+        return;
+    }
+
+    IEntity* entity = nullptr;
+    EntityGUID guid = 0;
+    std::string guardReason;
+    if (!CoopRuntimeGuards::TryGuardedCall(
+            "breakable SetHealth GetEntity",
+            [breakable]() { return breakable->GetEntity(); },
+            entity,
+            &guardReason) ||
+        !entity ||
+        !CoopRuntimeGuards::TryGuardedCall(
+            "breakable SetHealth GetGuid",
+            [entity]() { return entity->GetGuid(); },
+            guid,
+            &guardReason) ||
+        guid == 0)
+    {
+        ++m_breakableHealthEventSkips;
+        m_lastBreakableHealthEvent =
+            "skip_missing_guid_reason_" + BreakableStatusToken(guardReason);
+        return;
+    }
+
+    const uint16_t encodedHealth = EncodeBreakableHealth(after);
+    if (!QueueLocalAreaObjectEventForHook(
+            CoopProtocol::kAreaObjectEventBreakableHealth,
+            static_cast<uint64_t>(guid),
+            encodedHealth,
+            0,
+            reason))
+    {
+        ++m_breakableHealthEventSkips;
+        m_lastBreakableHealthEvent =
+            "queue_failed_guid_" + std::to_string(static_cast<uint64_t>(guid)) +
+            "_health_" + std::to_string(after);
+        return;
+    }
+
+    ++m_breakableHealthEventsQueued;
+    m_lastBreakableHealthEvent =
+        "queued_guid_" + std::to_string(static_cast<uint64_t>(guid)) +
+        "_before_" + std::to_string(before) +
+        "_after_" + std::to_string(after) +
+        "_encoded_" + std::to_string(encodedHealth);
+}
+
+void ModMain::OnNativeBreakableGlassImpact(
+    const EventPhysCollision& collision,
+    uint64_t targetGuid,
+    int glassSide,
+    int glassSlot,
+    bool staticTarget)
+{
+    ++m_breakableGlassHookCalls;
+    // A replay intentionally re-enters Vanilla's glass hook. It is an echo
+    // suppression path, not a dropped local impact.
+    if (m_applyingRemoteAreaObjectEvent)
+        return;
+    if (m_saveLoadGuardActive || m_arkLevelTransitionLoadActive ||
+        IsPostLoadNativeQuarantineActive() ||
+        m_networkMode == CoopNetworkMode::Off || !IsSessionGameplayReady() ||
+        targetGuid == 0 || glassSide < 0 || glassSide > 1 ||
+        glassSlot < 0 || glassSlot > std::numeric_limits<uint16_t>::max())
+    {
+        ++m_breakableGlassEventSkips;
+        m_lastBreakableGlassEvent =
+            "skip_guid_" + std::to_string(targetGuid) +
+            "_side_" + std::to_string(glassSide) +
+            "_slot_" + std::to_string(glassSlot);
+        return;
+    }
+
+    BreakableGlassImpactWire wire = {};
+    for (int axis = 0; axis < 3; ++axis)
+    {
+        wire.point[axis] = collision.pt[axis];
+        wire.normal[axis] = collision.n[axis];
+        wire.localVelocity[0][axis] = EncodeGlassHalf(collision.vloc[0][axis]);
+        wire.localVelocity[1][axis] = EncodeGlassHalf(collision.vloc[1][axis]);
+    }
+    wire.mass[0] = EncodeGlassHalf(collision.mass[0]);
+    wire.mass[1] = EncodeGlassHalf(collision.mass[1]);
+    wire.penetration = EncodeGlassHalf(collision.penetration);
+    wire.normalImpulse = EncodeGlassHalf(collision.normImpulse);
+    wire.radius = EncodeGlassHalf(collision.radius);
+    for (int side = 0; side < 2; ++side)
+    {
+        wire.partId[side] = static_cast<int16_t>(std::clamp(
+            collision.partid[side],
+            static_cast<int>(std::numeric_limits<int16_t>::min()),
+            static_cast<int>(std::numeric_limits<int16_t>::max())));
+        wire.materialId[side] = collision.idmat[side];
+        wire.primitiveId[side] = collision.iPrim[side];
+    }
+
+    if (!std::isfinite(wire.point[0]) || !std::isfinite(wire.point[1]) ||
+        !std::isfinite(wire.point[2]) || !std::isfinite(wire.normal[0]) ||
+        !std::isfinite(wire.normal[1]) || !std::isfinite(wire.normal[2]))
+    {
+        ++m_breakableGlassEventSkips;
+        m_lastBreakableGlassEvent = "skip_non_finite_impact";
+        return;
+    }
+
+    const std::string encoded = EncodeGlassPayload(wire);
+    if (encoded.size() >= CoopProtocol::kAreaObjectWireTextValueCapacity ||
+        !QueueLocalAreaObjectEventForHook(
+            CoopProtocol::kAreaObjectEventBreakableGlassImpact,
+            targetGuid,
+            static_cast<uint16_t>(glassSlot),
+            static_cast<uint32_t>(glassSide) |
+                (staticTarget ? kBreakableGlassStaticTargetFlag : 0u),
+            "CActionGame::OnCollisionLogged_Breakable",
+            0,
+            encoded.c_str()))
+    {
+        ++m_breakableGlassEventSkips;
+        m_lastBreakableGlassEvent =
+            "queue_failed_guid_" + std::to_string(targetGuid) +
+            "_side_" + std::to_string(glassSide) +
+            "_slot_" + std::to_string(glassSlot);
+        return;
+    }
+
+    ++m_breakableGlassEventsQueued;
+    m_lastBreakableGlassEvent =
+        "queued_guid_" + std::to_string(targetGuid) +
+        "_side_" + std::to_string(glassSide) +
+        "_slot_" + std::to_string(glassSlot) +
+        "_static_" + std::to_string(staticTarget ? 1 : 0) +
+        "_accepted_" + std::to_string(s_lastImpactBreaksGlassDecision) +
+        "_foreign_" + std::to_string(collision.iForeignData[0]) + "," +
+            std::to_string(collision.iForeignData[1]) +
+        "_part_" + std::to_string(collision.partid[0]) + "," +
+            std::to_string(collision.partid[1]) +
+        "_material_" + std::to_string(collision.idmat[0]) + "," +
+            std::to_string(collision.idmat[1]) +
+        "_point_" + std::to_string(collision.pt.x) + "," +
+            std::to_string(collision.pt.y) + "," +
+            std::to_string(collision.pt.z);
+}
+
+bool ModMain::ApplyAreaObjectBreakableGlassImpact(
+    const CoopProtocol::AreaObjectEventPacket& packet,
+    std::string& detail)
+{
+    if (packet.targetGuid == 0 ||
+        (packet.flags & ~(kBreakableGlassStaticTargetFlag | 1u)) != 0 ||
+        packet.targetClassHash != HashStoryString("BreakableGlass") ||
+        std::memchr(packet.textValue, '\0', sizeof(packet.textValue)) == nullptr ||
+        !gEnv || !gEnv->pEntitySystem)
+    {
+        ++m_breakableGlassEventSkips;
+        detail = "invalid_breakable_glass_payload";
+        return false;
+    }
+
+    const auto* terminator = static_cast<const char*>(
+        std::memchr(packet.textValue, '\0', sizeof(packet.textValue)));
+    const size_t encodedLength = static_cast<size_t>(terminator - packet.textValue);
+    BreakableGlassImpactWire wire = {};
+    if (!DecodeGlassPayload(std::string_view(packet.textValue, encodedLength), wire) ||
+        !std::isfinite(wire.point[0]) || !std::isfinite(wire.point[1]) ||
+        !std::isfinite(wire.point[2]) || !std::isfinite(wire.normal[0]) ||
+        !std::isfinite(wire.normal[1]) || !std::isfinite(wire.normal[2]))
+    {
+        ++m_breakableGlassEventSkips;
+        detail = "invalid_breakable_glass_impact_encoding";
+        return false;
+    }
+
+    const bool staticTarget =
+        (packet.flags & kBreakableGlassStaticTargetFlag) != 0;
+    EntityId targetEntityId = INVALID_ENTITYID;
+    IEntity* targetEntity = nullptr;
+    std::string reason;
+    if (!staticTarget)
+        CoopRuntimeGuards::TryGuardedCall(
+            "breakable glass apply FindEntityByGuid",
+            [&packet]()
+            {
+                return gEnv->pEntitySystem->FindEntityByGuid(
+                    static_cast<EntityGUID>(packet.targetGuid));
+            },
+            targetEntityId,
+            &reason);
+    if (!staticTarget && targetEntityId != INVALID_ENTITYID)
+    {
+        CoopRuntimeGuards::TryGuardedCall(
+            "breakable glass apply GetEntity",
+            [targetEntityId]() { return gEnv->pEntitySystem->GetEntity(targetEntityId); },
+            targetEntity,
+            &reason);
+    }
+
+    if (!staticTarget && !targetEntity)
+    {
+        RefreshAllBreakableGlassRegistrations();
+        for (auto it = s_registeredBreakableGlass.begin();
+             it != s_registeredBreakableGlass.end();)
+        {
+            IEntity* candidate = gEnv->pEntitySystem->GetEntity(it->first);
+            if (!candidate || it->second.stableId == 0 ||
+                it->second.stableId != BuildBreakableGlassStableId(*candidate) ||
+                it->second.slots.empty())
+            {
+                it = s_registeredBreakableGlass.erase(it);
+                continue;
+            }
+            if (it->second.stableId == packet.targetGuid)
+            {
+                targetEntity = candidate;
+                targetEntityId = candidate->GetId();
+                break;
+            }
+            ++it;
+        }
+    }
+
+    // Dynamically spawned scene windows have no authored GUID and do not enter
+    // CEntity's glass registry until their first native impact. Resolve their
+    // deterministic name/class/position identity before replaying that impact.
+    if (!staticTarget && !targetEntity)
+    {
+        targetEntity = FindEntityByBreakableGlassStableId(packet.targetGuid);
+        if (targetEntity)
+            targetEntityId = targetEntity->GetId();
+    }
+
+    if (!staticTarget && !targetEntity)
+    {
+        ++m_breakableGlassEventSkips;
+        detail = "missing_breakable_glass_stable_id_" +
+            std::to_string(packet.targetGuid);
+        return false;
+    }
+
+    const int glassSide = static_cast<int>(packet.flags & 1u);
+    const int sourceSide = 1 - glassSide;
+    ray_hit staticHit;
+    std::memset(&staticHit, 0, sizeof(staticHit));
+    IPhysicalEntity* targetPhysics = nullptr;
+    void* targetForeignData = nullptr;
+    int targetForeignType = PHYS_FOREIGN_ID_ENTITY;
+    if (staticTarget)
+    {
+        if (!ResolveStaticBreakableGlassTarget(
+                Vec3(wire.point[0], wire.point[1], wire.point[2]),
+                Vec3(wire.normal[0], wire.normal[1], wire.normal[2]),
+                wire.materialId[glassSide],
+                staticHit,
+                reason))
+        {
+            ++m_breakableGlassEventSkips;
+            detail = "missing_static_breakable_glass_guid_" +
+                std::to_string(packet.targetGuid) + "_reason_" +
+                BreakableStatusToken(reason);
+            return false;
+        }
+        targetPhysics = staticHit.pCollider;
+        targetForeignType = PHYS_FOREIGN_ID_STATIC;
+        if (!CoopRuntimeGuards::TryGuardedCall(
+                "breakable glass static foreign data",
+                [targetPhysics]()
+                {
+                    return targetPhysics->GetForeignData(PHYS_FOREIGN_ID_STATIC);
+                },
+                targetForeignData,
+                &reason) ||
+            !targetForeignData)
+        {
+            ++m_breakableGlassEventSkips;
+            detail = "missing_static_breakable_glass_foreign_data_guid_" +
+                std::to_string(packet.targetGuid) + "_reason_" +
+                BreakableStatusToken(reason);
+            return false;
+        }
+    }
+    else
+    {
+        targetPhysics = targetEntity->GetPhysics();
+        targetForeignData = targetEntity;
+    }
+    if (!targetPhysics || targetPhysics == WORLD_ENTITY)
+    {
+        ++m_breakableGlassEventSkips;
+        detail = "missing_breakable_glass_physics_guid_" + std::to_string(packet.targetGuid);
+        return false;
+    }
+
+    EventPhysCollision collision;
+    collision.deferredResult = 0;
+    collision.pEntity[glassSide] = targetPhysics;
+    collision.pForeignData[glassSide] = targetForeignData;
+    collision.iForeignData[glassSide] = targetForeignType;
+    // The remote player's proxy is not the weapon body that made the native
+    // impact. CryEngine reserves this foreign id for reconstructed events and
+    // accepts it without dereferencing or class-checking a synthetic collider.
+    collision.pEntity[sourceSide] = nullptr;
+    collision.pForeignData[sourceSide] = nullptr;
+    collision.iForeignData[sourceSide] = PHYS_FOREIGN_ID_ARK_SERIALIZED_EVENT;
+    collision.idCollider = staticTarget ? 0 : static_cast<int>(targetEntity->GetId());
+    collision.pt = Vec3(wire.point[0], wire.point[1], wire.point[2]);
+    collision.n = Vec3(wire.normal[0], wire.normal[1], wire.normal[2]);
+    for (int side = 0; side < 2; ++side)
+    {
+        collision.vloc[side] = Vec3(
+            DecodeGlassHalf(wire.localVelocity[side][0]),
+            DecodeGlassHalf(wire.localVelocity[side][1]),
+            DecodeGlassHalf(wire.localVelocity[side][2]));
+        collision.mass[side] = DecodeGlassHalf(wire.mass[side]);
+        collision.partid[side] = wire.partId[side];
+        collision.idmat[side] = wire.materialId[side];
+        collision.iPrim[side] = wire.primitiveId[side];
+    }
+    if (staticTarget)
+    {
+        collision.pt = staticHit.pt;
+        collision.n = staticHit.n;
+        collision.partid[glassSide] = staticHit.partid;
+        collision.idmat[glassSide] = staticHit.surface_idx;
+        collision.iPrim[glassSide] = static_cast<short>(std::clamp(
+            staticHit.iPrim,
+            static_cast<int>(std::numeric_limits<short>::min()),
+            static_cast<int>(std::numeric_limits<short>::max())));
+    }
+    collision.penetration = DecodeGlassHalf(wire.penetration);
+    collision.normImpulse = DecodeGlassHalf(wire.normalImpulse);
+    collision.radius = DecodeGlassHalf(wire.radius);
+
+    s_lastImpactBreaksGlassDecision = -1;
+    const bool applied = CoopRuntimeGuards::TryGuardedVoidCall(
+            "breakable glass apply native serialized collision",
+            [&collision]()
+            {
+                CActionGame::OnCollisionLogged_Breakable(&collision);
+            },
+            &reason);
+    if (!applied)
+    {
+        ++m_breakableGlassEventSkips;
+        detail = "breakable_glass_native_apply_failed_guid_" +
+            std::to_string(packet.targetGuid) + "_reason_" +
+            BreakableStatusToken(reason);
+        return false;
+    }
+
+    int deformResult = -1;
+    if (staticTarget && collision.iPrim[glassSide] < 0)
+    {
+        // Save-game break replay uses this exact path for authored glass whose
+        // break event has no source primitive. Replaying only the collision
+        // logger records the break but leaves the static render mesh intact.
+        if (!CoopRuntimeGuards::TryGuardedCall(
+                "breakable glass deform static mesh",
+                [&collision, targetPhysics]()
+                {
+                    return gEnv->pPhysicalWorld->DeformPhysicalEntity(
+                        targetPhysics,
+                        collision.pt,
+                        collision.n,
+                        collision.penetration,
+                        1);
+                },
+                deformResult,
+                &reason) ||
+            !CoopRuntimeGuards::TryGuardedVoidCall(
+                "breakable glass update deforming meshes first pass",
+                []() { gEnv->pPhysicalWorld->UpdateDeformingEntities(0.0f); },
+                &reason) ||
+            !CoopRuntimeGuards::TryGuardedVoidCall(
+                "breakable glass update deforming meshes second pass",
+                []() { gEnv->pPhysicalWorld->UpdateDeformingEntities(0.0f); },
+                &reason))
+        {
+            ++m_breakableGlassEventSkips;
+            detail = "breakable_glass_native_deform_failed_guid_" +
+                std::to_string(packet.targetGuid) + "_reason_" +
+                BreakableStatusToken(reason);
+            return false;
+        }
+    }
+
+    ++m_breakableGlassEventsApplied;
+    m_lastBreakableGlassEvent =
+        "applied_guid_" + std::to_string(packet.targetGuid) +
+        "_side_" + std::to_string(glassSide) +
+        "_slot_" + std::to_string(packet.value) +
+        "_static_" + std::to_string(staticTarget ? 1 : 0) +
+        "_accepted_" + std::to_string(s_lastImpactBreaksGlassDecision) +
+        "_deform_" + std::to_string(deformResult) +
+        "_foreign_" + std::to_string(collision.iForeignData[0]) + "," +
+            std::to_string(collision.iForeignData[1]) +
+        "_part_" + std::to_string(collision.partid[0]) + "," +
+            std::to_string(collision.partid[1]) +
+        "_material_" + std::to_string(collision.idmat[0]) + "," +
+            std::to_string(collision.idmat[1]) +
+        "_point_" + std::to_string(collision.pt.x) + "," +
+            std::to_string(collision.pt.y) + "," +
+            std::to_string(collision.pt.z);
+    detail = m_lastBreakableGlassEvent;
+    return true;
+}
+
+bool ModMain::ApplyAreaObjectBreakableHealth(
+    uint64_t targetGuid,
+    uint16_t encodedHealth,
+    std::string& detail)
+{
+    float requestedHealth = 0.0f;
+    if (targetGuid == 0 || !DecodeBreakableHealth(encodedHealth, requestedHealth) ||
+        !gEnv || !gEnv->pEntitySystem)
+    {
+        ++m_breakableHealthEventSkips;
+        detail = "invalid_breakable_health_payload";
+        return false;
+    }
+
+    EntityId entityId = INVALID_ENTITYID;
+    IEntity* entity = nullptr;
+    std::string reason;
+    if (!CoopRuntimeGuards::TryGuardedCall(
+            "breakable apply FindEntityByGuid",
+            [targetGuid]() { return gEnv->pEntitySystem->FindEntityByGuid(static_cast<EntityGUID>(targetGuid)); },
+            entityId,
+            &reason) ||
+        entityId == INVALID_ENTITYID ||
+        !CoopRuntimeGuards::TryGuardedCall(
+            "breakable apply GetEntity",
+            [entityId]() { return gEnv->pEntitySystem->GetEntity(entityId); },
+            entity,
+            &reason) ||
+        !entity)
+    {
+        if (requestedHealth <= kBreakableHealthEpsilon)
+        {
+            detail = "already_missing_broken_breakable_guid_" + std::to_string(targetGuid);
+            return true;
+        }
+        ++m_breakableHealthEventSkips;
+        detail = "missing_breakable_guid_" + std::to_string(targetGuid);
+        return false;
+    }
+
+    CArkBreakable* breakable = GetBreakableExtension(*entity, &reason);
+    float before = 0.0f;
+    if (!breakable ||
+        !CoopRuntimeGuards::TryGuardedCall(
+            "breakable apply read before",
+            [breakable]() { return breakable->m_health; },
+            before,
+            &reason) ||
+        !std::isfinite(before))
+    {
+        ++m_breakableHealthEventSkips;
+        detail = "missing_breakable_extension_guid_" + std::to_string(targetGuid) +
+            "_reason_" + BreakableStatusToken(reason);
+        return false;
+    }
+
+    const float desiredHealth = std::min(before, requestedHealth);
+    if (before <= desiredHealth + kBreakableHealthEpsilon)
+    {
+        detail = "already_breakable_health_guid_" + std::to_string(targetGuid) +
+            "_health_" + std::to_string(before);
+        return true;
+    }
+
+    if (!CoopRuntimeGuards::TryGuardedVoidCall(
+            "breakable apply SetHealth",
+            [breakable, desiredHealth]() { breakable->SetHealth(desiredHealth); },
+            &reason))
+    {
+        ++m_breakableHealthEventSkips;
+        detail = "breakable_set_health_failed_guid_" + std::to_string(targetGuid) +
+            "_reason_" + BreakableStatusToken(reason);
+        return false;
+    }
+
+    float after = before;
+    if (!CoopRuntimeGuards::TryGuardedCall(
+            "breakable apply read after",
+            [breakable]() { return breakable->m_health; },
+            after,
+            &reason) ||
+        !std::isfinite(after) || after > desiredHealth + kBreakableHealthEpsilon)
+    {
+        ++m_breakableHealthEventSkips;
+        detail = "breakable_health_verify_failed_guid_" + std::to_string(targetGuid) +
+            "_before_" + std::to_string(before) +
+            "_desired_" + std::to_string(desiredHealth) +
+            "_after_" + std::to_string(after);
+        return false;
+    }
+
+    ++m_breakableHealthEventsApplied;
+    m_lastBreakableHealthEvent =
+        "applied_guid_" + std::to_string(targetGuid) +
+        "_before_" + std::to_string(before) +
+        "_after_" + std::to_string(after) +
+        "_encoded_" + std::to_string(encodedHealth);
+    detail = m_lastBreakableHealthEvent;
+    return true;
+}
+
+bool ModMain::DebugSpawnBreakableSyncTarget(std::string& detail, bool scalable)
+{
+    std::string reason;
+    IEntity* entity = nullptr;
+    CArkBreakable* breakable = GetDebugBreakable(&entity, reason);
+    if (!breakable)
+    {
+        if (!gEnv || !gEnv->pEntitySystem ||
+            !ArkPlayer::GetInstancePtr() || !ArkPlayer::GetInstance().GetEntity())
+        {
+            detail = "debug_breakable_runtime_unavailable";
+            return false;
+        }
+
+        const uint64_t archetypeId = scalable ? kDebugScalableBreakableArchetype : kDebugBreakableArchetype;
+        const EntityGUID guid = scalable ? kDebugScalableBreakableGuid : kDebugBreakableGuid;
+        IEntityArchetype* archetype = nullptr;
+        const bool hasArchetype = CoopRuntimeGuards::TryGuardedCall(
+                "debug breakable GetEntityArchetype",
+                [archetypeId]() { return gEnv->pEntitySystem->GetEntityArchetype(archetypeId); },
+                archetype,
+                &reason) && archetype;
+        if (!hasArchetype)
+        {
+            if (scalable)
+            {
+                detail = "missing_debug_breakable_archetype_" + std::to_string(archetypeId);
+                return false;
+            }
+            breakable = FindNearestAuthoredBreakable(&entity, reason);
+        }
+        else
+        {
+            IEntity* playerEntity = ArkPlayer::GetInstance().GetEntity();
+            SEntitySpawnParams params;
+            params.guid = guid;
+            params.sName = scalable ? "CoopScalableBreakableSyncTest" : "CoopBreakableSyncTest";
+            params.pArchetype = archetype;
+            params.pClass = archetype->GetClass();
+            params.vPosition = playerEntity->GetWorldPos() + playerEntity->GetWorldRotation().GetColumn1() * 3.0f;
+            params.qRotation = playerEntity->GetWorldRotation();
+            if (!CoopRuntimeGuards::TryGuardedCall(
+                    "debug breakable SpawnEntityFromArchetype",
+                    [&params, archetype]() { return gEnv->pEntitySystem->SpawnEntityFromArchetype(archetype, params, true); },
+                    entity,
+                    &reason) ||
+                !entity)
+            {
+                if (scalable)
+                {
+                    detail = "debug_breakable_spawn_failed_reason_" + BreakableStatusToken(reason);
+                    return false;
+                }
+                breakable = FindNearestAuthoredBreakable(&entity, reason);
+            }
+            else
+            {
+                breakable = GetBreakableExtension(*entity, &reason);
+            }
+        }
+    }
+
+    if (!breakable || !entity)
+    {
+        detail = "debug_breakable_extension_failed_reason_" + BreakableStatusToken(reason);
+        return false;
+    }
+
+    float health = 0.0f;
+    if (!CoopRuntimeGuards::TryGuardedCall(
+            "debug breakable read spawned health",
+            [breakable]() { return breakable->m_health; },
+            health,
+            &reason))
+    {
+        detail = "debug_breakable_health_read_failed_reason_" + BreakableStatusToken(reason);
+        return false;
+    }
+    detail = "debug_breakable_entity_" + std::to_string(entity->GetId()) +
+        "_guid_" + std::to_string(static_cast<uint64_t>(entity->GetGuid())) +
+        "_health_" + std::to_string(health);
+    return true;
+}
+
+bool ModMain::DebugProbeBreakableSyncTarget(std::string& detail, uint64_t targetGuid)
+{
+    std::string reason;
+    IEntity* entity = nullptr;
+    CArkBreakable* breakable = targetGuid != 0 ?
+        GetBreakableByGuid(targetGuid, &entity, reason) : GetDebugBreakable(&entity, reason);
+    float health = 0.0f;
+    if (!breakable || !entity ||
+        !CoopRuntimeGuards::TryGuardedCall(
+            "debug breakable probe health",
+            [breakable]() { return breakable->m_health; },
+            health,
+            &reason))
+    {
+        detail = "debug_breakable_probe_failed_reason_" + BreakableStatusToken(reason);
+        return false;
+    }
+    detail = "debug_breakable_entity_" + std::to_string(entity->GetId()) +
+        "_guid_" + std::to_string(static_cast<uint64_t>(entity->GetGuid())) +
+        "_health_" + std::to_string(health) +
+        "_broken_" + std::to_string(health <= kBreakableHealthEpsilon ? 1 : 0);
+    return true;
+}
+
+bool ModMain::DebugSetBreakableSyncTargetHealth(float health, std::string& detail, uint64_t targetGuid)
+{
+    if (!std::isfinite(health) || health < 0.0f || health > kMaxHalfFloat)
+    {
+        detail = "invalid_debug_breakable_health";
+        return false;
+    }
+
+    std::string reason;
+    IEntity* entity = nullptr;
+    CArkBreakable* breakable = targetGuid != 0 ?
+        GetBreakableByGuid(targetGuid, &entity, reason) : GetDebugBreakable(&entity, reason);
+    if (!breakable || !entity ||
+        !CoopRuntimeGuards::TryGuardedVoidCall(
+            "debug breakable SetHealth",
+            [breakable, health]() { breakable->SetHealth(health); },
+            &reason))
+    {
+        detail = "debug_breakable_set_failed_reason_" + BreakableStatusToken(reason);
+        return false;
+    }
+    return DebugProbeBreakableSyncTarget(detail, targetGuid);
+}
+
+bool ModMain::DebugBreakableGlassCommand(
+    const std::string& target,
+    bool impact,
+    std::string& detail)
+{
+    if (!gEnv || !gEnv->pEntitySystem ||
+        !ArkPlayer::GetInstancePtr() || !ArkPlayer::GetInstance().GetEntity())
+    {
+        detail = "breakable_glass_runtime_unavailable";
+        return false;
+    }
+
+    if (impact)
+    {
+        detail = "breakable_glass_impact_requires_native_weapon_collision";
+        return false;
+    }
+
+    RefreshAllBreakableGlassRegistrations();
+    IEntity* selectedEntity = nullptr;
+    float selectedDistanceSq = std::numeric_limits<float>::max();
+    size_t validTargets = 0;
+    size_t validSlots = 0;
+    const Vec3 playerPosition =
+        ArkPlayer::GetInstance().GetEntity()->GetWorldPos();
+
+    if (target != "nearest")
+    {
+        std::string targetDetail;
+        selectedEntity = ResolveRuntimeEntityTarget(target, targetDetail);
+        if (!selectedEntity)
+        {
+            detail = "breakable_glass_target_missing_" +
+                BreakableStatusToken(targetDetail);
+            return false;
+        }
+    }
+
+    for (auto it = s_registeredBreakableGlass.begin();
+         it != s_registeredBreakableGlass.end();)
+    {
+        IEntity* entity = gEnv->pEntitySystem->GetEntity(it->first);
+        if (!entity || it->second.stableId == 0 ||
+            entity->GetGuid() != it->second.guid ||
+            it->second.stableId != BuildBreakableGlassStableId(*entity) ||
+            it->second.slots.empty())
+        {
+            it = s_registeredBreakableGlass.erase(it);
+            continue;
+        }
+
+        ++validTargets;
+        validSlots += it->second.slots.size();
+        if (target == "nearest")
+        {
+            const float distanceSq =
+                (entity->GetWorldPos() - playerPosition).GetLengthSquared();
+            if (distanceSq < selectedDistanceSq)
+            {
+                selectedEntity = entity;
+                selectedDistanceSq = distanceSq;
+            }
+        }
+        ++it;
+    }
+
+    const auto registered = selectedEntity
+        ? s_registeredBreakableGlass.find(selectedEntity->GetId())
+        : s_registeredBreakableGlass.end();
+    if (!selectedEntity || registered == s_registeredBreakableGlass.end() ||
+        registered->second.slots.empty())
+    {
+        detail = "breakable_glass_not_yet_native_registered_targets_" +
+            std::to_string(validTargets) + "_slots_" +
+            std::to_string(validSlots);
+        return false;
+    }
+
+    detail = "breakable_glass_target_id_" +
+        std::to_string(selectedEntity->GetId()) + "_guid_" +
+        std::to_string(registered->second.stableId) + "_slot_" +
+        std::to_string(*registered->second.slots.begin()) + "_targets_" +
+        std::to_string(validTargets) + "_slots_" +
+        std::to_string(validSlots);
+    return true;
+}
