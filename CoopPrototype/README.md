@@ -13,7 +13,7 @@
 
 1. Start Prey through Chairloader.
 2. Select `Multiplayer` in Prey's main menu. The same entry is available from the pause menu.
-3. Use `Profile` to set the player name, account mode/id and model. Danielle Sho, Morgan Yu M/F, Sylvain Bellamy, Grant Lockwood and Mariana Arias have embedded in-game portraits.
+3. Use `Profile` to set the player name, account mode/id and model.
 4. The Host uses `Host Game` to choose a name, capacity from 2 to 16, port, LAN visibility and open/password/allowlist admission.
 5. Other players use `Server Browser` for discovered LAN hosts, favorites or recents. Direct IPv4 join remains available for routed Internet sessions.
 6. Follow the bounded join overlay through connection, Host save, player state, world load and area readiness. Rejections and the no-response timeout return to the browser with a readable reason.

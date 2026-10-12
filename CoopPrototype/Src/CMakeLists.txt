@@ -32,7 +32,6 @@ set(SOURCE_FILES
 	CoopLivePropSync.cpp
 	CoopMultiplayerUi.cpp
 	CoopPortraits.cpp
-	CoopPortraitAssets.generated.h
 	CoopHudPostFx.cpp
 	CoopHazardSync.cpp
 	CoopDialogueSync.cpp
