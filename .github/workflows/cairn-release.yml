@@ -1,76 +1,72 @@
 name: Cairn release
 
-# A Cairn release is a bare X.Y.Z tag on main. It builds the mod (CoopPrototype) on Windows against the Chairloader revision this project supports
-# (CoopPrototype/ChairloaderCompat/base-revision.txt) with the vcpkg baseline of CoopPrototype/vcpkg.json, puts it into a Cairn mod pack
-# (.github/cairn/Build-Pack.ps1) and publishes the pack, pack-index.json and game.json: the Cairn launcher reads the index to install and update
-# this mod. RELEASE_CHANNEL=beta publishes a pre-release (only players who chose beta are offered it).
+# A Cairn release is a bare X.Y.Z tag on main. The mod (CoopPrototype) is built the way the project builds it (build-msvc.sh: clang-cl with the Windows
+# SDK fetched by xwin, in a container), against the Chairloader revision it supports (CoopPrototype/ChairloaderCompat/base-revision.txt). The DLL goes
+# into a Cairn mod pack (.github/cairn/Build-Pack.ps1) and the pack, pack-index.json and game.json are published: the Cairn launcher reads the index
+# to install and update this mod. RELEASE_CHANNEL=beta publishes a pre-release (only players who chose beta are offered it).
 on:
   push:
     tags: ['[0-9]+.[0-9]+.[0-9]+']
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  pack:
-    runs-on: windows-2022   # with its Clang toolset: the project is built with clang-cl, MSVC rejects some lambda captures the code relies on
-    timeout-minutes: 240
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
 
       - name: The tag must be on main and equal VERSION
         if: startsWith(github.ref, 'refs/tags/')
-        shell: pwsh
+        shell: bash
         run: |
           git fetch origin main
-          git merge-base --is-ancestor $env:GITHUB_SHA origin/main
-          if ($LASTEXITCODE -ne 0) { throw "tag $env:GITHUB_REF_NAME is not on main" }
-          $v = (Get-Content VERSION -TotalCount 1).Trim()
-          if ($v -ne $env:GITHUB_REF_NAME) { throw "tag $env:GITHUB_REF_NAME is not VERSION ($v)" }
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "tag $GITHUB_REF_NAME is not on main"; exit 1; }
+          v="$(head -n1 VERSION | tr -d '\r\n ')"
+          [ "$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME is not VERSION ($v)"; exit 1; }
 
       - name: Get the Chairloader revision this mod is built against
-        shell: pwsh
+        shell: bash
         run: |
-          $rev = (Get-Content CoopPrototype/ChairloaderCompat/base-revision.txt -TotalCount 1).Trim()
+          rev="$(head -n1 CoopPrototype/ChairloaderCompat/base-revision.txt | tr -d '\r\n ')"
           git clone --filter=blob:none https://github.com/thelivingdiamond/Chairloader chairloader
-          git -C chairloader checkout $rev
-          if ($LASTEXITCODE -ne 0) { throw "Chairloader $rev is not there" }
-          git -C chairloader submodule update --init --depth 1 2>&1 | Out-Host
+          git -C chairloader checkout "$rev"
 
-      # The baseline the manifest pins needs an MSYS2 package (pkgconf) that MSYS2 no longer serves, so the build uses vcpkg's current
-      # commit as its baseline: the manifest in this workspace is rewritten (not committed) and the libraries are the versions of that commit.
-      - name: Get vcpkg
-        shell: pwsh
+      - name: Build the mod
+        shell: bash
+        env:
+          BUILD_JOBS: '1'
         run: |
-          git clone https://github.com/microsoft/vcpkg vcpkg
-          $head = (git -C vcpkg rev-parse HEAD).Trim()
-          Write-Host "vcpkg baseline: $head"
-          $m = Get-Content CoopPrototype/vcpkg.json -Raw | ConvertFrom-Json
-          $m.'builtin-baseline' = $head
-          $m | ConvertTo-Json -Depth 8 | Set-Content CoopPrototype/vcpkg.json -Encoding utf8
-          ./vcpkg/bootstrap-vcpkg.bat -disableMetrics
-      - name: Configure
-        shell: pwsh
-        run: |
-          cmake -S CoopPrototype -B build -A x64 -T ClangCL `
-            "-DCMAKE_TOOLCHAIN_FILE=$env:GITHUB_WORKSPACE/vcpkg/scripts/buildsystems/vcpkg.cmake" `
-            "-DCHAIRLOADER_COMMON_PATH=$env:GITHUB_WORKSPACE/chairloader/Common"
-          if ($LASTEXITCODE -ne 0) { throw 'configuring failed' }
+          CHAIRLOADER_COMMON_PATH="$PWD/chairloader/Common" ./build-msvc.sh
+          ls -l CoopPrototype/CoopPrototype.dll
 
-      - name: Build
-        shell: pwsh
-        run: |
-          cmake --build build --config Release --parallel 1   # the project builds with one job: ModMain.cpp is very large
-          if ($LASTEXITCODE -ne 0) { throw 'building failed' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coopprototype-dll
+          path: CoopPrototype/CoopPrototype.dll
+          if-no-files-found: error
+
+  pack:
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: coopprototype-dll
+          path: dl
 
       - name: Build the pack
         shell: pwsh
-        run: |
-          $dll = @(Get-ChildItem build -Recurse -Filter CoopPrototype.dll -File | Where-Object { $_.FullName -match 'Release' })
-          if ($dll.Count -ne 1) { throw "expected one CoopPrototype.dll, found $($dll.Count)" }
-          ./.github/cairn/Build-Pack.ps1 -Dll $dll[0].FullName
+        run: ./.github/cairn/Build-Pack.ps1 -Dll dl/CoopPrototype.dll
 
       - name: Changelog
         shell: pwsh
