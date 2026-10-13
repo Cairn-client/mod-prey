@@ -1,0 +1,46 @@
+{
+  "schema": 1,
+  "id": "prey",
+  "name": "Prey",
+  "developer": "Arkane Studios",
+  "franchise": "Prey",
+  "steamAppId": 480490,
+  "exe": "Prey.exe",
+  "description": "Explore Talos I together. CoopPrototype adds co-op to Prey (2017) as a Chairloader mod: every player keeps their own Morgan, with the campaign, enemies, devices and physics shared through a host.",
+  "accent": "#4FB3C8",
+  "images": {
+    "background": "prey.jpg",
+    "logo": "prey-logo.png",
+    "hero": "prey-hero.jpg",
+    "poster": "prey-poster.jpg",
+    "screenshots": [ "prey-shot-1.jpg", "prey-shot-2.jpg" ]
+  },
+  "ownSession": true,
+  "setup": [
+    { "kind": "steam-running" },
+    { "kind": "steam-app", "appId": 480490, "title": "Prey", "detail": "Install Prey (2017) from your Steam library." },
+    { "kind": "game-found" },
+    { "kind": "mod-installed", "detail": "Download the mod above: Cairn puts it in the Mods folder of the game. Chairloader 1.3.4 must be installed on the game first." }
+  ],
+  "hostSteps": [
+    "Install Chairloader 1.3.4 on Prey with its own manager first (the mod is a Chairloader mod and is made for that version), then download the mod above.",
+    "Start Prey through Chairloader and switch the Coop Prototype mod on in its manager.",
+    "In the main menu choose Multiplayer, then Host Game: pick a name, the capacity (2 to 16), the port (27015 UDP by default) and who may join.",
+    "Share your address with your friends: open the port on your router for play over the Internet."
+  ],
+  "joinSteps": [
+    "Install Chairloader 1.3.4 on Prey, download the mod above (the same version as the host's) and start Prey through Chairloader with the mod on.",
+    "In the main menu choose Multiplayer: pick a game in the Server Browser, or join the host's address directly.",
+    "Follow the join overlay until the host's world is loaded. Each player needs their own Chairloader profile."
+  ],
+  "features": [
+    { "title": "Sessions", "items": [
+      { "name": "Host and join", "detail": "Up to 16 players through a host, by address or from the LAN server browser. Everyone needs the same game, Chairloader and mod version.", "status": "inTest" },
+      { "name": "Kept up to date", "detail": "Cairn installs the mod in the game's Mods folder and updates it when a new version is released." }
+    ] },
+    { "title": "Co-op", "items": [
+      { "name": "One Morgan per player", "detail": "Each player keeps their own character and inventory, saved to their account.", "status": "inTest" },
+      { "name": "Shared campaign", "detail": "Story progress, enemies, devices and physics results are decided by the host and shared.", "status": "inTest" }
+    ] }
+  ]
+}
