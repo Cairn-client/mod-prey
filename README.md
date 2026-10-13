@@ -1,81 +1,22 @@
-# Prey Coop
+# CoopPrototype on Cairn
 
-This is the standalone development repository for `CoopPrototype`, a
-Chairloader multiplayer co-op mod for Prey (2017).
+A fork of [x0rp01s0n/prey-coop](https://github.com/x0rp01s0n/prey-coop), the multiplayer mod for **Prey (2017)**, made to run on the [Cairn launcher](https://github.com/Cairn-client/launcher).
 
-The mod keeps one native player and one independently restored player state per
-account. Shared campaign, world, device, enemy and physics outcomes are routed
-through explicit authority lanes. Product usage, ownership rules and current
-limitations are documented in
-[`CoopPrototype/README.md`](CoopPrototype/README.md).
+## What we changed
 
-## Repository Layout
+- A Cairn pack: the mod is published as a pack the launcher installs and updates, built with the project's own container build.
 
-- `CoopPrototype/`: mod source, embedded UI assets and user documentation
-- `BuildTools/`: reproducible Clang/Xwin/MSVC container support
-- `build-msvc.sh`: isolated Linux build entry point
+The mod's own code and credits are its authors'. Everything else is as upstream; see [UPSTREAM.md](UPSTREAM.md) for the version this fork is based on.
 
-Prey data, Chairloader binaries, generated DLL/PDB/MAP files, local saves,
-runtime logs, caches, reverse-engineering dumps, test fixtures and private
-engineering notes are deliberately not tracked.
+## Play it
 
-## Build
+1. Install [Cairn](https://github.com/Cairn-client/launcher/releases/latest).
+2. Open Prey (2017) in the Library, download the mod and press Play.
 
-The mod needs a Chairloader checkout because it compiles Chairloader's `Common`
-sources as a static dependency.
+It runs on Chairloader 1.3.4, which has to be installed first.
 
-### Chairloader SDK compatibility
+Each release of this repository is the pack the launcher downloads.
 
-The supported upstream Chairloader revision is
-`97899fbd86ab183a08ed579d6f95ed40262c7e15`. The checkout must be clean by
-default. During CMake configuration, its `Common/` directory is copied to
-`${CMAKE_BINARY_DIR}/_deps/chairloader-sdk/Common`, supplemented with the small
-compatibility overlay in this repository, and patched only inside that private
-build tree. The supplied Chairloader checkout is never modified.
+## Licence
 
-The Linux wrapper reports the source checkout's Git HEAD and `Common/` dirty
-state before mounting `Common/` read-only in the build container. Native CMake
-builds inspect the checkout directly. A revision mismatch, local SDK changes,
-overlay collision, or patch applicability failure stops configuration.
-
-For deliberate forward-compatibility testing, revision and cleanliness checks
-can be relaxed while retaining overlay and patch validation:
-
-```bash
-COOP_ALLOW_UNSUPPORTED_CHAIRLOADER=ON \
-CHAIRLOADER_COMMON_PATH=/path/to/Chairloader/Common \
-./build-msvc.sh
-```
-
-The `CoopAbiSmokeTest` executable is compiled and linked before the mod DLL and
-asserts the restored `ArkTurret` ABI, including `sizeof(ArkTurret) == 3720`.
-
-On Linux with Podman:
-
-```bash
-CHAIRLOADER_COMMON_PATH=/path/to/Chairloader/Common ./build-msvc.sh
-```
-
-The script creates the `prey-msvc-buildtools` image when needed, downloads
-Microsoft Detours into the ignored `_deps` directory, configures the
-Clang/Xwin/MSVC Release build and writes:
-
-```text
-CoopPrototype/CoopPrototype.dll
-CoopPrototype/CoopPrototype.pdb
-CoopPrototype/CoopPrototype.map
-```
-
-Set `BUILD_JOBS` to change the compiler parallelism. The default is `1` because
-the current `ModMain.cpp` translation unit is large. Set
-`COOP_REBUILD_IMAGE=1` to rebuild the container image.
-
-For a native Windows build, configure `CoopPrototype/` with CMake 3.25 or newer,
-the repository's `CoopPrototype/vcpkg.json` manifest and
-`-DCHAIRLOADER_COMMON_PATH=C:/path/to/Chairloader/Common`. Use
-`-DCOOP_ALLOW_UNSUPPORTED_CHAIRLOADER=ON` only for intentional compatibility
-testing against another revision.
-
-## License
-
-GPL-3.0. See [`LICENSE`](LICENSE).
+GPL-3.0, as upstream. Prey (2017) belongs to Arkane Studios; this project is unofficial and not affiliated with or endorsed by them.
