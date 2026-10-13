@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   pack:
-    runs-on: windows-latest
+    runs-on: windows-2022   # the mod does not build with the newest Visual Studio compiler (it rejects some lambda captures the code relies on)
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
