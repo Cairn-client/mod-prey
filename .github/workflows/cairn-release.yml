@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   pack:
-    runs-on: windows-2022   # the mod does not build with the newest Visual Studio compiler (it rejects some lambda captures the code relies on)
+    runs-on: windows-2022   # with its Clang toolset: the project is built with clang-cl, MSVC rejects some lambda captures the code relies on
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
@@ -54,7 +54,7 @@ jobs:
       - name: Configure
         shell: pwsh
         run: |
-          cmake -S CoopPrototype -B build -A x64 `
+          cmake -S CoopPrototype -B build -A x64 -T ClangCL `
             "-DCMAKE_TOOLCHAIN_FILE=$env:GITHUB_WORKSPACE/vcpkg/scripts/buildsystems/vcpkg.cmake" `
             "-DCHAIRLOADER_COMMON_PATH=$env:GITHUB_WORKSPACE/chairloader/Common"
           if ($LASTEXITCODE -ne 0) { throw 'configuring failed' }
