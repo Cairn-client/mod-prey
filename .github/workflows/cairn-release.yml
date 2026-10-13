@@ -39,15 +39,18 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Chairloader $rev is not there" }
           git -C chairloader submodule update --init --depth 1 2>&1 | Out-Host
 
-      - name: Get vcpkg at the baseline of the manifest
+      # The baseline the manifest pins needs an MSYS2 package (pkgconf) that MSYS2 no longer serves, so the build uses vcpkg's current
+      # commit as its baseline: the manifest in this workspace is rewritten (not committed) and the libraries are the versions of that commit.
+      - name: Get vcpkg
         shell: pwsh
         run: |
-          $baseline = (Get-Content CoopPrototype/vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
           git clone https://github.com/microsoft/vcpkg vcpkg
-          git -C vcpkg checkout $baseline
-          if ($LASTEXITCODE -ne 0) { throw "vcpkg $baseline is not there" }
+          $head = (git -C vcpkg rev-parse HEAD).Trim()
+          Write-Host "vcpkg baseline: $head"
+          $m = Get-Content CoopPrototype/vcpkg.json -Raw | ConvertFrom-Json
+          $m.'builtin-baseline' = $head
+          $m | ConvertTo-Json -Depth 8 | Set-Content CoopPrototype/vcpkg.json -Encoding utf8
           ./vcpkg/bootstrap-vcpkg.bat -disableMetrics
-
       - name: Configure
         shell: pwsh
         run: |
